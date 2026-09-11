@@ -306,10 +306,14 @@ class TelemetryServer:
             elif msg_type == "config":
                 preset = msg.get("mounting_preset", "UNKNOWN")
                 self.health.update_mounting(preset)
-                if hasattr(self.wrapper.engine, "core") and hasattr(self.wrapper.engine.core, "adapter"):
-                    preset_mat = self.wrapper.engine.core.adapter.PRESETS.get(preset.upper())
+                adapter = getattr(self.wrapper.engine, "adapter", None)
+                if adapter is None and hasattr(self.wrapper.engine, "core"):
+                    adapter = getattr(self.wrapper.engine.core, "adapter", None)
+
+                if adapter is not None:
+                    preset_mat = adapter.PRESETS.get(preset.upper())
                     if preset_mat is not None:
-                        self.wrapper.engine.core.adapter.R_mount = preset_mat
+                        adapter.R_mount = preset_mat
                 print(f"[CONFIG] Mounting preset updated to: {preset}")
             else:
                 # Unknown type
@@ -344,11 +348,16 @@ class TelemetryServer:
 
                 # Realistic heading from attitude matrix
                 heading_deg = 0.0
-                if hasattr(engine, "core") and hasattr(engine.core, "Rot"):
+                rot_mat = getattr(engine, "Rot", None)
+                if rot_mat is None and hasattr(engine, "core"):
+                    rot_mat = getattr(engine.core, "Rot", None)
+
+                if rot_mat is not None:
                     try:
                         from ai_dr_core.lie_algebra import to_rpy
-                        r, p, y = to_rpy(engine.core.Rot)
-                        heading_deg = float(np.degrees(y) % 360)
+                        r, p_ang, y = to_rpy(rot_mat)
+                        yaw_offset = getattr(self.wrapper, "gnss_yaw_offset", 0.0)
+                        heading_deg = float((np.degrees(y) + np.degrees(yaw_offset)) % 360)
                     except Exception:
                         heading_deg = 0.0
 
