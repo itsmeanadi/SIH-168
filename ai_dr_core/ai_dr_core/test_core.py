@@ -59,7 +59,8 @@ def run_validation():
     # 4. Test Single Step Update
     print("\n[4/5] Testing Single-Step Update: state = engine.update(...)")
     t0 = 1000.0
-    state0 = engine.update(t0, phone_accel, phone_gyro)
+    phone_stationary = [0.0, 9.80665, 0.0]
+    state0 = engine.update(t0, phone_stationary, [0.0, 0.0, 0.0])
     assert isinstance(state0, NavState)
 
     # Second step at t + 20ms (50 Hz smartphone rate)

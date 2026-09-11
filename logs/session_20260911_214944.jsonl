@@ -1,0 +1,4 @@
+{"type": "imu", "timestamp": 1789143584.473253, "data": {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0.0, 0.0, 9.81], "gyroscope": [0.0, 0.0, 0.0]}}
+{"type": "gnss", "timestamp": 1789143584.475182, "data": {"type": "gnss", "timestamp": 1700000000.0, "latitude": 23.25, "longitude": 77.41, "speed": 5.0, "heading": 90.0, "accuracy": 1.0}}
+{"type": "imu", "timestamp": 1789143584.485193, "data": {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0.0, 0.0, 9.81], "gyroscope": [0.0, 0.0, 0.0]}}
+{"type": "imu", "timestamp": 1789143584.485538, "data": {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0.0, 0.0, 9.81], "gyroscope": [0.0, 0.0, 0.0]}}

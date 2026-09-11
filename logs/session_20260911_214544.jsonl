@@ -1,0 +1,2 @@
+{"type": "imu", "timestamp": 1789143344.246156, "data": {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0.0, 0.0, 9.81], "gyroscope": [0.0, 0.0, 0.0]}}
+{"type": "imu", "timestamp": 1789143344.269705, "data": {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0.0, 0.0, 9.81], "gyroscope": [0.0, 0.0, 0.0]}}

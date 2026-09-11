@@ -1,0 +1,7 @@
+{"type": "imu", "timestamp": 1789145431.24707, "data": {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0.0, 0.0, 9.81], "gyroscope": [0.0, 0.0, 0.0]}}
+{"type": "gnss", "timestamp": 1789145431.248827, "data": {"type": "gnss", "timestamp": 1700000000.0, "latitude": 23.25, "longitude": 77.41, "speed": 5.0, "heading": 90.0, "accuracy": 1.0}}
+{"type": "imu", "timestamp": 1789145431.265201, "data": {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0.0, 0.0, 9.81], "gyroscope": [0.0, 0.0, 0.0]}}
+{"type": "imu", "timestamp": 1789145431.265533, "data": {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0.0, 0.0, 9.81], "gyroscope": [0.0, 0.0, 0.0]}}
+{"type": "imu", "timestamp": 1789145431.267907, "data": {"acc_x": 0.1, "acc_y": 0.2, "acc_z": 9.81, "gyro_x": 0.01, "gyro_y": 0.02, "gyro_z": 0.03, "timestamp": 1700000000.0, "type": "imu", "accelerometer": [0.1, 0.2, 9.81], "gyroscope": [0.01, 0.02, 0.03]}}
+{"type": "gnss", "timestamp": 1789145431.268215, "data": {"latitude": 28.61, "longitude": 77.2, "speed_mps": 5.5, "heading_deg": 45.0, "accuracy_m": 2.5, "timestamp": 1700000000.0, "type": "gnss", "speed": 5.5, "heading": 45.0, "accuracy": 2.5}}
+{"type": "imu", "timestamp": 1789145431.269755, "data": {"type": "imu", "timestamp": 1700000000.0, "accel": {"x": 0.0, "y": 0.5, "z": 9.8}, "gyro": {"x": 0.0, "y": 0.0, "z": 0.1}, "accelerometer": [0.0, 0.5, 9.8], "gyroscope": [0.0, 0.0, 0.1]}}

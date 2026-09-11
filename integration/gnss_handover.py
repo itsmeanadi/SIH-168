@@ -173,13 +173,12 @@ class GNSSHandoverWrapper:
             self.imu_buffer.pop(0)
 
         self.is_zupt_active = False
-        if self.mode == "GNSS" and self.latest_gnss_speed is not None:
-            if self.latest_gnss_speed < self.gnss_speed_threshold:
-                if self._check_imu_stationary():
-                    self.is_zupt_active = True
-                    y_zero = np.zeros(3)
-                    self.engine.update(y_zero, self.zupt_R)
-                    # We don't print every ZUPT to avoid flooding, but we could
-                    # print(f"[ZUPT] Active | Speed: {self.latest_gnss_speed:.2f}")
+        is_stationary_imu = self._check_imu_stationary()
+        is_stationary_gnss = self.latest_gnss_speed is not None and self.latest_gnss_speed < self.gnss_speed_threshold
+
+        if is_stationary_imu or is_stationary_gnss or not self.is_aligned:
+            self.is_zupt_active = True
+            y_zero = np.zeros(3)
+            self.engine.update(y_zero, self.zupt_R)
 
         self.engine.predict(imu_sample)

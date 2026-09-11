@@ -1,6 +1,5 @@
-# File: integration/ws_server.py
-
 import asyncio
+import http
 import json
 import math
 import time
@@ -55,6 +54,14 @@ except (ImportError, AttributeError):
 
             def update(self, y, R):
                 self.core.v = np.asarray(y, dtype=np.float64)
+
+            @property
+            def motion_state(self):
+                return getattr(self.core, "motion_state", "NORMAL")
+
+            @property
+            def ai_trust(self):
+                return getattr(self.core, "ai_trust", 1.0)
     except (ImportError, AttributeError):
         class AIEKFEngine:
             def __init__(self):
@@ -76,6 +83,7 @@ class TelemetryValidator:
     def __init__(self, max_imu_dt: float = 0.2):
         self.max_imu_dt = max_imu_dt
         self.last_imu_ts = None
+        self._last_gap_ts = None
 
     def normalize_timestamp(self, ts: float) -> float:
         if ts > 1e11:
@@ -97,7 +105,29 @@ class TelemetryValidator:
             return False, f"Invalid timestamp: {raw_ts}"
 
         acc = msg.get("accelerometer")
+        if acc is None:
+            acc = msg.get("accel") if msg.get("accel") is not None else msg.get("acc")
+        if isinstance(acc, dict):
+            acc = [
+                acc.get("x", acc.get("acc_x", 0.0)),
+                acc.get("y", acc.get("acc_y", 0.0)),
+                acc.get("z", acc.get("acc_z", 0.0)),
+            ]
+        elif acc is None and "acc_x" in msg and "acc_y" in msg and "acc_z" in msg:
+            acc = [msg["acc_x"], msg["acc_y"], msg["acc_z"]]
+
         gyro = msg.get("gyroscope")
+        if gyro is None:
+            gyro = msg.get("gyro")
+        if isinstance(gyro, dict):
+            gyro = [
+                gyro.get("x", gyro.get("gyro_x", 0.0)),
+                gyro.get("y", gyro.get("gyro_y", 0.0)),
+                gyro.get("z", gyro.get("gyro_z", 0.0)),
+            ]
+        elif gyro is None and "gyro_x" in msg and "gyro_y" in msg and "gyro_z" in msg:
+            gyro = [msg["gyro_x"], msg["gyro_y"], msg["gyro_z"]]
+
         if not isinstance(acc, (list, tuple)) or len(acc) != 3:
             return False, f"Invalid accelerometer array: {acc}"
         if not isinstance(gyro, (list, tuple)) or len(gyro) != 3:
@@ -116,10 +146,23 @@ class TelemetryValidator:
             if dt <= 0.0:
                 return False, f"Timestamp out of order or duplicate: dt={dt:.4f}s"
             if dt > self.max_imu_dt:
+                if self._last_gap_ts is not None:
+                    gap_dt = ts - self._last_gap_ts
+                    if 0.0 < gap_dt <= self.max_imu_dt:
+                        self.last_imu_ts = ts
+                        self._last_gap_ts = None
+                        msg["timestamp"] = ts
+                        msg["accelerometer"] = [float(v) for v in acc]
+                        msg["gyroscope"] = [float(v) for v in gyro]
+                        return True, ""
+                self._last_gap_ts = ts
                 return False, f"Excessive IMU gap: dt={dt:.4f}s"
 
+        self._last_gap_ts = None
         self.last_imu_ts = ts
         msg["timestamp"] = ts
+        msg["accelerometer"] = [float(v) for v in acc]
+        msg["gyroscope"] = [float(v) for v in gyro]
         return True, ""
 
     def validate_gnss(self, msg: dict) -> tuple[bool, str]:
@@ -137,7 +180,12 @@ class TelemetryValidator:
             return False, f"Invalid timestamp: {raw_ts}"
 
         lat = msg.get("latitude")
+        if lat is None:
+            lat = msg.get("lat")
         lon = msg.get("longitude")
+        if lon is None:
+            lon = msg.get("lon") if msg.get("lon") is not None else msg.get("lng")
+
         if type(lat) is bool or not isinstance(lat, (int, float)) or not math.isfinite(lat):
             return False, f"Invalid latitude: {lat}"
         if type(lon) is bool or not isinstance(lon, (int, float)) or not math.isfinite(lon):
@@ -148,11 +196,32 @@ class TelemetryValidator:
         if not (-180 <= lon <= 180):
             return False, f"Longitude out of range: {lon}"
 
-        for k in ("speed", "heading", "accuracy"):
-            v = msg.get(k)
-            if v is not None:
-                if type(v) is bool or not isinstance(v, (int, float)) or not math.isfinite(v):
-                    return False, f"Invalid {k}: {v}"
+        msg["latitude"] = float(lat)
+        msg["longitude"] = float(lon)
+
+        speed = msg.get("speed")
+        if speed is None:
+            speed = msg.get("speed_mps")
+        if speed is not None:
+            if type(speed) is bool or not isinstance(speed, (int, float)) or not math.isfinite(speed):
+                return False, f"Invalid speed: {speed}"
+            msg["speed"] = float(speed)
+
+        heading = msg.get("heading")
+        if heading is None:
+            heading = msg.get("heading_deg") if msg.get("heading_deg") is not None else msg.get("bearing")
+        if heading is not None:
+            if type(heading) is bool or not isinstance(heading, (int, float)) or not math.isfinite(heading):
+                return False, f"Invalid heading: {heading}"
+            msg["heading"] = float(heading)
+
+        accuracy = msg.get("accuracy")
+        if accuracy is None:
+            accuracy = msg.get("accuracy_m")
+        if accuracy is not None:
+            if type(accuracy) is bool or not isinstance(accuracy, (int, float)) or not math.isfinite(accuracy):
+                return False, f"Invalid accuracy: {accuracy}"
+            msg["accuracy"] = float(accuracy)
 
         msg["timestamp"] = self.normalize_timestamp(raw_ts)
         return True, ""
@@ -186,6 +255,24 @@ class TelemetryServer:
 
             msg_type = msg.get("type")
 
+            # Handle composite sensor frame (e.g. from Android Web Bridge / PWA / mobile clients)
+            if msg_type == "sensor_frame" or ("imu" in msg and isinstance(msg.get("imu"), dict)):
+                imu_data = msg.get("imu")
+                gnss_data = msg.get("gnss") if msg.get("gnss") is not None else msg.get("gps")
+
+                if imu_data and isinstance(imu_data, dict):
+                    if "timestamp" not in imu_data:
+                        imu_data["timestamp"] = msg.get("timestamp", time.time())
+                    imu_data.setdefault("type", "imu")
+                    self.on_message(imu_data, client)
+
+                if gnss_data and isinstance(gnss_data, dict) and (gnss_data.get("latitude") is not None or gnss_data.get("lat") is not None):
+                    if "timestamp" not in gnss_data:
+                        gnss_data["timestamp"] = msg.get("timestamp", time.time())
+                    gnss_data.setdefault("type", "gnss")
+                    self.on_message(gnss_data, client)
+                return
+
             # Get or create validator for this specific client session
             validator = self.validators.setdefault(client, TelemetryValidator())
 
@@ -198,7 +285,6 @@ class TelemetryServer:
                     self.recorder.record("imu", msg)
                     self.wrapper.process_imu(msg)
                 else:
-                    print(f"[REJECTED] IMU packet: {reason}")
                     self.health.record_rejection()
 
             elif msg_type == "gnss":
@@ -215,12 +301,15 @@ class TelemetryServer:
                     self.recorder.record("gnss", msg)
                     self.wrapper.handle_gnss(msg)
                 else:
-                    print(f"[REJECTED] GNSS packet: {reason}")
                     self.health.record_rejection()
 
             elif msg_type == "config":
                 preset = msg.get("mounting_preset", "UNKNOWN")
                 self.health.update_mounting(preset)
+                if hasattr(self.wrapper.engine, "core") and hasattr(self.wrapper.engine.core, "adapter"):
+                    preset_mat = self.wrapper.engine.core.adapter.PRESETS.get(preset.upper())
+                    if preset_mat is not None:
+                        self.wrapper.engine.core.adapter.R_mount = preset_mat
                 print(f"[CONFIG] Mounting preset updated to: {preset}")
             else:
                 # Unknown type
@@ -247,13 +336,41 @@ class TelemetryServer:
                 lon = lon if lon is not None else 0.0
 
                 # Construct payload for the mobile app
+                nav_mode = getattr(self.wrapper, "mode", "DR")
+                is_aligned = getattr(self.wrapper, "is_aligned", False)
+                motion_state = getattr(engine, "motion_state", "NORMAL")
+                ai_trust = float(getattr(engine, "ai_trust", 1.0))
+                is_zupt = getattr(self.wrapper, "is_zupt_active", False)
+
+                # Realistic heading from attitude matrix
+                heading_deg = 0.0
+                if hasattr(engine, "core") and hasattr(engine.core, "Rot"):
+                    try:
+                        from ai_dr_core.lie_algebra import to_rpy
+                        r, p, y = to_rpy(engine.core.Rot)
+                        heading_deg = float(np.degrees(y) % 360)
+                    except Exception:
+                        heading_deg = 0.0
+
+                # Clamped speed to prevent drift when stationary
+                raw_speed = float(np.linalg.norm(v) * 3.6) if v is not None else 0.0
+                if not is_aligned or is_zupt or raw_speed < 0.6:
+                    reported_speed = 0.0
+                else:
+                    reported_speed = raw_speed
+
                 payload = {
                     "type": "vehicle_position",
                     "lat": lat,
                     "lng": lon,
-                    "heading": 0.0, # Simplified for demo
-                    "speed": np.linalg.norm(v) * 3.6, # m/s to km/h
-                    "timestamp": time.time()
+                    "heading": heading_deg,
+                    "speed": reported_speed,
+                    "timestamp": time.time(),
+                    "nav_mode": nav_mode,
+                    "is_aligned": is_aligned,
+                    "motion_state": motion_state,
+                    "ai_trust": ai_trust,
+                    "zupt_active": is_zupt,
                 }
 
 
@@ -282,6 +399,7 @@ class TelemetryServer:
         """Prints system status to console at 1 Hz."""
         while True:
             status = self.health.get_status()
+            engine = self.wrapper.engine
 
             # Clear terminal
             print("\033[H\033[J", end="")
@@ -345,9 +463,10 @@ class TelemetryServer:
             print(f"\nNAVIGATION")
             print(f"Mode       : {status.current_mode}")
             print(f"Rate       : {status.nav_rate:5.1f} Hz")
+            print(f"State      : {getattr(engine, 'motion_state', 'NORMAL')}")
+            print(f"AI Trust   : {getattr(engine, 'ai_trust', 1.0):5.2f}")
 
             # Position
-            engine = self.wrapper.engine
             lat, lon = self.wrapper.get_current_latlon()
             print(f"\nPosition")
             print(f"Lat        : {lat:.6f}" if lat else "Lat        : N/A")
@@ -358,6 +477,7 @@ class TelemetryServer:
             print(f"\nVelocity")
             print(f"Vx         : {v[0]:5.2f}")
             print(f"Vy         : {v[1]:5.2f}")
+            print(f"Speed      : {np.linalg.norm(v)*3.6:5.2f} km/h")
 
             # ZUPT
             zupt = "ACTIVE" if getattr(self.wrapper, 'is_zupt_active', False) else "INACTIVE"
@@ -383,15 +503,22 @@ async def main():
         except Exception:
             pass
         finally:
-            server.connected_clients.remove(websocket)
-            # Cleanup validator state for this session
+            server.connected_clients.discard(websocket)
             if websocket in server.validators:
                 del server.validators[websocket]
+
+    def process_request(conn, req):
+        if req.headers.get("Upgrade", "").lower() != "websocket":
+            return conn.respond(
+                http.HTTPStatus.OK,
+                '{"status": "healthy", "service": "idr-telemetry"}\n',
+            )
+        return None
 
     print("Starting IDR Telemetry WebSocket Server on ws://0.0.0.0:8765...")
 
     # Run server, output loop, and diagnostic loop concurrently
-    async with websockets.serve(ws_handler, "0.0.0.0", 8765):
+    async with websockets.serve(ws_handler, "0.0.0.0", 8765, process_request=process_request):
         await asyncio.gather(
             server.output_loop(),
             server.diagnostic_loop(),

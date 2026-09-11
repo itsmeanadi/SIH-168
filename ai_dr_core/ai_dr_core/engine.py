@@ -24,6 +24,8 @@ class NavState:
     accel_bias: np.ndarray           # [b_ax, b_ay, b_az] in m/s^2
     cov_measurement: np.ndarray      # [cov_lat, cov_up] predicted by AI
     uncertainty_p: np.ndarray        # 21-dim diagonal of covariance P
+    motion_state: str = "NORMAL"     # "NORMAL", "HIGH_DYNAMICS", "SHAKE_PROTECTED"
+    ai_trust: float = 1.0            # Trust multiplier [0.0, 1.0]
 
 
 class EngineParameters:
@@ -36,8 +38,8 @@ class EngineParameters:
         # Continuous process noise covariances
         self.cov_omega = 2e-4
         self.cov_acc = 1e-3
-        self.cov_b_omega = 1e-8
-        self.cov_b_acc = 1e-6
+        self.cov_b_omega = 1e-5      # Fix 3: smartphone gyro bias drift >> automotive
+        self.cov_b_acc = 1e-4        # Fix 2: fast bias tracking for gravity residuals
         self.cov_Rot_c_i = 1e-8
         self.cov_t_c_i = 1e-8
 
@@ -50,11 +52,27 @@ class EngineParameters:
         self.cov_t_c_i0 = 1e-2
 
         # Default base NHC measurement noise
-        self.cov_lat = 1.0
-        self.cov_up = 10.0
+        self.cov_lat = 0.2           # Fix 1: tight lateral constraint for ground vehicle
+        self.cov_up = 0.5            # Fix 1: tight vertical constraint for ground vehicle
 
         # Normalization frequency
         self.n_normalize_rot = 100
+
+        # Fix 4: velocity sanity bounds
+        self.max_speed = 69.4        # 250 km/h hard clamp
+        self.max_accel = 15.0        # ~1.5g max rate of velocity change
+
+        # Fix 5: adaptive gravity re-alignment
+        self.gravity_realign_alpha = 0.01          # EMA blending rate per step
+
+        # Fix 6: engine-level ZUPT (windowed stationary detector)
+        self.zupt_gyro_std_tol = 0.05    # rad/s: max gyro per-axis std in window
+        self.zupt_acc_horiz_tol = 0.15   # m/s^2: max horizontal acceleration in world frame
+
+        # Fix 7: Shake & Motion Integrity thresholds
+        self.shake_acc_std_thresh = 1.2   # m/s^2: per-axis acceleration std threshold
+        self.shake_gyro_std_thresh = 0.25  # rad/s: per-axis angular rate std threshold
+        self.shake_acc_mag_thresh = 2.0    # m/s^2: total acceleration std magnitude threshold
 
 
 class AIDREngine:
@@ -104,6 +122,17 @@ class AIDREngine:
         self.last_timestamp: Optional[float] = None
         self.step_count = 0
         self.latest_measurement_cov = np.array([self.params.cov_lat, self.params.cov_up], dtype=np.float64)
+        self._prev_speed: float = 0.0   # Fix 4: for acceleration rate limiting
+
+        # Fix 5/6: Windowed stationary & motion integrity detector buffer
+        self._acc_buffer = []     # recent vehicle-frame accel samples
+        self._gyro_buffer = []    # recent vehicle-frame gyro samples
+        self._stationary_buffer_size = 25  # ~0.5s at 50Hz
+        self._is_stationary = False
+
+        # Motion & Sensor Integrity State
+        self.motion_state: str = "NORMAL"  # "NORMAL", "HIGH_DYNAMICS", "SHAKE_PROTECTED"
+        self.ai_trust: float = 1.0         # Trust multiplier [0.0, 1.0]
 
         # Static tilt flag: Rot is initialized to identity; on the very first IMU
         # sample we compute roll/pitch from the measured gravity vector so that
@@ -135,6 +164,59 @@ class AIDREngine:
             y = np.radians(roll_pitch_yaw_deg[2])
             self.Rot = from_rpy(r, p, y)
 
+    def _update_motion_buffer(self, acc: np.ndarray, gyro: np.ndarray):
+        """Maintain sliding window buffer for motion statistics."""
+        self._acc_buffer.append(acc.copy())
+        self._gyro_buffer.append(gyro.copy())
+        if len(self._acc_buffer) > self._stationary_buffer_size:
+            self._acc_buffer.pop(0)
+            self._gyro_buffer.pop(0)
+
+    def _evaluate_motion_integrity(self):
+        """
+        Fix 7: Motion and Sensor Integrity Evaluation.
+        Detects abnormal handheld isotropic vibration vs legitimate vehicle dynamics.
+        - Handheld shake -> SHAKE_PROTECTED, ai_trust = 0.0
+        - Normal vehicle motion / legitimate acceleration / turns -> NORMAL / HIGH_DYNAMICS, ai_trust = 1.0
+        """
+        if len(self._acc_buffer) < self._stationary_buffer_size:
+            self.motion_state = "NORMAL"
+            self.ai_trust = 1.0
+            return
+
+        acc_arr = np.array(self._acc_buffer)
+        gyro_arr = np.array(self._gyro_buffer)
+
+        acc_std = np.std(acc_arr, axis=0)
+        gyro_std = np.std(gyro_arr, axis=0)
+        acc_std_mag = float(np.linalg.norm(acc_std))
+        gyro_std_mag = float(np.linalg.norm(gyro_std))
+
+        acc_axes_high = int(np.sum(acc_std > self.params.shake_acc_std_thresh))
+        gyro_axes_high = int(np.sum(gyro_std > self.params.shake_gyro_std_thresh))
+        transverse_gyro_std = float(np.linalg.norm(gyro_std[:2]))
+
+        # Isotropic handheld shake: simultaneous multi-axis acceleration and gyro fluctuations
+        is_shake = (
+            (acc_axes_high >= 2 or acc_std_mag > self.params.shake_acc_mag_thresh)
+            and (gyro_axes_high >= 1 or gyro_std_mag > self.params.shake_gyro_std_thresh or transverse_gyro_std > 0.18)
+        )
+
+        if is_shake:
+            self.motion_state = "SHAKE_PROTECTED"
+            self.ai_trust = 0.0
+        else:
+            acc_mean = np.mean(acc_arr, axis=0)
+            acc_world_mean = self.Rot.dot(acc_mean - self.b_acc) + self.params.g
+            horiz_acc_mag = float(np.linalg.norm(acc_world_mean[:2]))
+            yaw_rate_mag = float(abs(np.mean(gyro_arr[:, 2])))
+
+            if horiz_acc_mag > 1.5 or yaw_rate_mag > 0.3 or acc_std_mag > 0.8:
+                self.motion_state = "HIGH_DYNAMICS"
+            else:
+                self.motion_state = "NORMAL"
+            self.ai_trust = 1.0
+
     def update(self,
                timestamp: float,
                accelerometer: Union[list, np.ndarray],
@@ -156,29 +238,19 @@ class AIDREngine:
 
         # First sample initialization
         if self.last_timestamp is None:
-            # Static gravity alignment: estimate roll & pitch from the first
-            # accelerometer reading so that gravity cancels in _propagate.
-            # Convention (ZYX, body-to-world, Rot = Rz(yaw)*Ry(pitch)*Rx(roll)):
-            #   At rest:  Rot * f_b + g_world = 0
-            #             => Rot * f_b = [0, 0, +9.80655]   (world-up)
-            #             => f_b / |f_b| = Rot^T * [0,0,1]
-            # Extracting roll/pitch with yaw fixed at current yaw (0 at init):
-            #   pitch = atan2( fx,  sqrt(fy^2 + fz^2) )
-            #   roll  = atan2(-fy,  fz )
-            # where [fx, fy, fz] = f_b normalised.
-            # Yaw is NOT touched; it is determined solely by GNSS frame alignment.
             if not self._static_tilt_initialized:
                 norm_a = float(np.linalg.norm(acc))
                 if norm_a > 1.0:  # Guard: skip if adapter returned near-zero vector
                     f_hat = acc / norm_a          # unit vector (body frame)
                     fx, fy, fz = f_hat[0], f_hat[1], f_hat[2]
-                    roll_est  = float(np.arctan2(-fy, fz))
-                    pitch_est = float(np.arctan2(fx, np.sqrt(fy * fy + fz * fz)))
+                    roll_est  = float(np.arctan2(fy, fz))
+                    pitch_est = float(np.arctan2(-fx, np.sqrt(fy * fy + fz * fz)))
                     # Preserve existing yaw (0 at cold start, or whatever set_initial_state set)
                     _, _, current_yaw = to_rpy(self.Rot)
                     self.Rot = from_rpy(roll_est, pitch_est, current_yaw)
                 self._static_tilt_initialized = True
             self.last_timestamp = t
+            self._update_motion_buffer(acc, gyro)
             return self._build_nav_state(t)
 
         dt = t - self.last_timestamp
@@ -186,6 +258,10 @@ class AIDREngine:
 
         # Bound dt safely against timer pauses or packet delays
         dt = float(np.clip(dt, 0.001, 0.25))
+
+        # Update motion statistics & evaluate motion integrity
+        self._update_motion_buffer(acc, gyro)
+        self._evaluate_motion_integrity()
 
         # 6D IMU vector [wx, wy, wz, ax, ay, az]
         u = np.concatenate([gyro, acc], axis=0)
@@ -202,7 +278,16 @@ class AIDREngine:
         # 4. Non-Holonomic Constraint (NHC) Measurement Update
         self._update_nhc(u, self.latest_measurement_cov)
 
-        # 5. Periodic Numerical SVD Normalization of Rotation Matrix
+        # 5. Fix 6: Engine-level stationary detection & ZUPT
+        self._zupt_update(acc, gyro)
+
+        # 6. Fix 5: Adaptive gravity re-alignment at low speed
+        self._gravity_realign(acc)
+
+        # 7. Fix 4: Velocity magnitude & rate-of-change clamping
+        self._clamp_velocity(dt)
+
+        # 8. Periodic Numerical SVD Normalization of Rotation Matrix
         self.step_count += 1
         if self.step_count % self.params.n_normalize_rot == 0:
             self.Rot = normalize_rot(self.Rot)
@@ -210,14 +295,14 @@ class AIDREngine:
         return self._build_nav_state(t)
 
     def _propagate(self, u: np.ndarray, dt: float):
-        """Propagate state and covariance over dt."""
+        """Propagate state and covariance over dt via pure strapdown inertial kinematics."""
         omega_unbiased = u[:3] - self.b_omega
         acc_unbiased = u[3:6] - self.b_acc
 
         # Specific force rotated to world frame + gravity
         acc_world = self.Rot.dot(acc_unbiased) + self.params.g
 
-        # Kinematics integration
+        # Pure physical kinematics integration
         self.p += self.v * dt + 0.5 * acc_world * (dt ** 2)
         self.v += acc_world * dt
         self.Rot = self.Rot.dot(so3exp(omega_unbiased * dt))
@@ -269,7 +354,9 @@ class AIDREngine:
 
         # Innovation: residual = - (v_lateral, v_vertical)
         r = -v_body[1:]
-        R = np.diag(np.clip(measurement_cov, 1e-4, 1e4))
+        # Scale measurement covariance by AI trust (reject/de-weight update when trust drops)
+        scaled_cov = measurement_cov / max(self.ai_trust, 1e-3)
+        R = np.diag(np.clip(scaled_cov, 1e-4, 1e4))
 
         # Innovation covariance S and Kalman Gain K
         S = H.dot(self.P).dot(H.T) + R
@@ -297,8 +384,92 @@ class AIDREngine:
         self.t_c_i += dx[18:21]
 
         # Joseph form covariance update for numerical stability
-        I_KH = IdP - K.dot(H)
+        I_KH = np.eye(self.params.P_dim) - K.dot(H)
         self.P = I_KH.dot(self.P).dot(I_KH.T) + K.dot(R).dot(K.T)
+
+    def _zupt_update(self, acc: np.ndarray, gyro: np.ndarray):
+        """Fix 6: Windowed zero-velocity update with shake protection and stationary latching."""
+        if len(self._acc_buffer) < self._stationary_buffer_size:
+            self._is_stationary = False
+            return
+
+        if self.motion_state == "SHAKE_PROTECTED":
+            self._is_stationary = True
+            self.v *= 0.70
+            return
+
+        gyro_arr = np.array(self._gyro_buffer)
+        acc_arr = np.array(self._acc_buffer)
+
+        # Gyro check: quiet rotation
+        gyro_std = np.std(gyro_arr, axis=0)
+        gyro_ok = bool(np.all(gyro_std < self.params.zupt_gyro_std_tol)) and float(np.linalg.norm(np.mean(gyro_arr, axis=0))) < 0.05
+
+        # Horizontal acceleration in world frame:
+        acc_mean = np.mean(acc_arr, axis=0)
+        acc_world_mean = self.Rot.dot(acc_mean - self.b_acc) + self.params.g
+        horiz_acc_ok = float(np.linalg.norm(acc_world_mean[:2])) < self.params.zupt_acc_horiz_tol
+
+        # When rotation is quiet and horizontal acceleration is low, vehicle/phone is stationary
+        self._is_stationary = gyro_ok and horiz_acc_ok
+
+        if self._is_stationary:
+            self.v[:] = 0.0
+
+    def _gravity_realign(self, acc: np.ndarray):
+        """Fix 5: Adaptive gravity re-alignment at low speed.
+        When stationary or at low speed with quiet gyro, slowly blends roll & pitch toward the measured gravity vector
+        to eliminate mount drift over time without disturbing yaw."""
+        speed = float(np.linalg.norm(self.v))
+        if speed > 0.3:
+            return
+
+        if len(self._acc_buffer) < self._stationary_buffer_size:
+            return
+
+        gyro_arr = np.array(self._gyro_buffer)
+        gyro_std = np.std(gyro_arr, axis=0)
+        gyro_quiet = bool(np.all(gyro_std < self.params.zupt_gyro_std_tol)) and float(np.linalg.norm(np.mean(gyro_arr, axis=0))) < 0.05
+        if not (self._is_stationary or gyro_quiet):
+            return
+
+        acc_mean = np.mean(self._acc_buffer, axis=0)
+        norm_a = float(np.linalg.norm(acc_mean))
+        g_mag = float(np.linalg.norm(self.params.g))
+
+        if norm_a < 1.0 or abs(norm_a - g_mag) > 1.0:
+            return
+
+        f_hat = acc_mean / norm_a
+        fx, fy, fz = float(f_hat[0]), float(f_hat[1]), float(f_hat[2])
+        roll_meas = float(np.arctan2(fy, fz))
+        pitch_meas = float(np.arctan2(-fx, np.sqrt(fy * fy + fz * fz)))
+
+        roll_cur, pitch_cur, yaw_cur = to_rpy(self.Rot)
+        alpha = self.params.gravity_realign_alpha
+        roll_new = roll_cur + alpha * (roll_meas - roll_cur)
+        pitch_new = pitch_cur + alpha * (pitch_meas - pitch_cur)
+
+        self.Rot = from_rpy(roll_new, pitch_new, yaw_cur)
+
+    def _clamp_velocity(self, dt: float):
+        """Fix 4: Hard velocity magnitude clamp and acceleration rate limiter."""
+        speed = float(np.linalg.norm(self.v))
+
+        # Rate-of-change limit: max_accel m/s per second
+        max_delta_speed = self.params.max_accel * dt
+        if abs(speed - self._prev_speed) > max_delta_speed:
+            if speed > 1e-6:
+                target_speed = self._prev_speed + np.sign(speed - self._prev_speed) * max_delta_speed
+                self.v *= (target_speed / speed)
+                speed = target_speed
+
+        # Hard magnitude clamp
+        if speed > self.params.max_speed:
+            self.v *= (self.params.max_speed / speed)
+            speed = self.params.max_speed
+
+        self._prev_speed = speed
 
     def _build_nav_state(self, timestamp: float) -> NavState:
         """Construct the NavState summary object."""
@@ -315,5 +486,7 @@ class AIDREngine:
             gyro_bias=self.b_omega.copy(),
             accel_bias=self.b_acc.copy(),
             cov_measurement=self.latest_measurement_cov.copy(),
-            uncertainty_p=np.diag(self.P).copy()
+            uncertainty_p=np.diag(self.P).copy(),
+            motion_state=self.motion_state,
+            ai_trust=self.ai_trust
         )

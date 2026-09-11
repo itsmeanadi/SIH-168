@@ -154,3 +154,69 @@ def test_per_client_validator_isolation():
     assert server.wrapper.imu_count == 2, (
         "Duplicate timestamp on client A must be rejected"
     )
+
+
+def test_sensor_frame_composite_message():
+    """Verify composite sensor_frame packets (Android web bridge / PWA) are unpacked and processed."""
+    server = TelemetryServer(MockWrapper())
+    raw_frame = '''{
+        "type": "sensor_frame",
+        "timestamp": 1700000000.0,
+        "imu": {
+            "acc_x": 0.1,
+            "acc_y": 0.2,
+            "acc_z": 9.81,
+            "gyro_x": 0.01,
+            "gyro_y": 0.02,
+            "gyro_z": 0.03,
+            "timestamp": 1700000000.0
+        },
+        "gnss": {
+            "latitude": 28.61,
+            "longitude": 77.20,
+            "speed_mps": 5.5,
+            "heading_deg": 45.0,
+            "accuracy_m": 2.5,
+            "timestamp": 1700000000.0
+        }
+    }'''
+    server.handle_raw_message(raw_frame, "client-pwa")
+    assert server.wrapper.imu_count == 1
+    assert server.wrapper.last_imu["accelerometer"] == [0.1, 0.2, 9.81]
+    assert server.wrapper.last_imu["gyroscope"] == [0.01, 0.02, 0.03]
+    assert server.wrapper.last_gnss["latitude"] == 28.61
+    assert server.wrapper.last_gnss["longitude"] == 77.20
+    assert server.wrapper.last_gnss["speed"] == 5.5
+    assert server.wrapper.last_gnss["heading"] == 45.0
+
+
+def test_imu_dict_and_aliases_accepted():
+    """Verify accelerometer and gyro as dicts or aliases are correctly normalized."""
+    server = TelemetryServer(MockWrapper())
+    msg = {
+        "type": "imu",
+        "timestamp": 1700000000.0,
+        "accel": {"x": 0.0, "y": 0.5, "z": 9.8},
+        "gyro": {"x": 0.0, "y": 0.0, "z": 0.1},
+    }
+    import json
+    server.handle_raw_message(json.dumps(msg), "client-alias")
+    assert server.wrapper.imu_count == 1
+    assert server.wrapper.last_imu["accelerometer"] == [0.0, 0.5, 9.8]
+    assert server.wrapper.last_imu["gyroscope"] == [0.0, 0.0, 0.1]
+
+
+def test_gap_recovery_does_not_permanently_lock_stream():
+    """Verify that after a single dropped gap > 0.2s, the validator recovers immediately."""
+    validator = TelemetryValidator(max_imu_dt=0.2)
+    s1 = {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0, 0, 9.81], "gyroscope": [0, 0, 0]}
+    assert validator.validate_imu(s1)[0] is True
+
+    # Gap of 0.5s exceeds max_imu_dt -> rejected
+    s_gap = {"type": "imu", "timestamp": 1700000000.5, "accelerometer": [0, 0, 9.81], "gyroscope": [0, 0, 0]}
+    assert validator.validate_imu(s_gap)[0] is False
+
+    # Next packet 0.02s later (50 Hz) -> MUST BE ACCEPTED (not stuck at previous ts)
+    s_next = {"type": "imu", "timestamp": 1700000000.52, "accelerometer": [0, 0, 9.81], "gyroscope": [0, 0, 0]}
+    assert validator.validate_imu(s_next)[0] is True
+

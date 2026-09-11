@@ -3,6 +3,7 @@
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+import numpy as np
 
 @dataclass
 class HealthStatus:
@@ -60,6 +61,7 @@ class HealthMonitor:
 
     def record_imu(self, ts: float, acc: list = None, gyro: list = None):
         now = time.time()
+        self._imu_count += 1
 
         # Sanity check: Constant sensor values
         if acc is not None and gyro is not None:
@@ -117,6 +119,7 @@ class HealthMonitor:
 
     def record_gnss(self, ts: float, accuracy=None, speed=None, heading=None):
         now = time.time()
+        self._gnss_count += 1
         self.status.last_gnss_ts = ts
         self.status.gnss_accuracy = accuracy
         self.status.gnss_speed = speed
@@ -153,6 +156,7 @@ class HealthMonitor:
 
     def record_nav(self):
         now = time.time()
+        self._nav_count += 1
         interval = now - self._last_nav_time
         self._last_nav_time = now
 
