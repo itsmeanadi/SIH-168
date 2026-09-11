@@ -3,6 +3,7 @@
 import asyncio
 import json
 import math
+import time
 from pathlib import Path
 import sys
 
@@ -67,7 +68,8 @@ except (ImportError, AttributeError):
                 self.v = np.asarray(y, dtype=float)
 
 from integration.gnss_handover import GNSSHandoverWrapper
-
+from integration.health_monitor import HealthMonitor
+from integration.recorder import SessionRecorder
 
 class TelemetryValidator:
 
@@ -80,9 +82,10 @@ class TelemetryValidator:
             return ts / 1000.0
         return float(ts)
 
-    def validate_imu(self, msg: dict) -> bool:
+    def validate_imu(self, msg: dict) -> tuple[bool, str]:
         if not isinstance(msg, dict):
-            return False
+            return False, "Message is not a JSON object"
+
         raw_ts = msg.get("timestamp")
         if (
             raw_ts is None
@@ -91,34 +94,38 @@ class TelemetryValidator:
             or not math.isfinite(raw_ts)
             or raw_ts <= 0
         ):
-            return False
+            return False, f"Invalid timestamp: {raw_ts}"
 
         acc = msg.get("accelerometer")
         gyro = msg.get("gyroscope")
         if not isinstance(acc, (list, tuple)) or len(acc) != 3:
-            return False
+            return False, f"Invalid accelerometer array: {acc}"
         if not isinstance(gyro, (list, tuple)) or len(gyro) != 3:
-            return False
+            return False, f"Invalid gyroscope array: {gyro}"
+
         if not all(
             type(v) is not bool and isinstance(v, (int, float)) and math.isfinite(v)
             for v in acc + gyro
         ):
-            return False
+            return False, "Non-finite or boolean value in sensor data"
 
         ts = self.normalize_timestamp(raw_ts)
 
         if self.last_imu_ts is not None:
             dt = ts - self.last_imu_ts
-            if dt <= 0.0 or dt > self.max_imu_dt:
-                return False
+            if dt <= 0.0:
+                return False, f"Timestamp out of order or duplicate: dt={dt:.4f}s"
+            if dt > self.max_imu_dt:
+                return False, f"Excessive IMU gap: dt={dt:.4f}s"
 
         self.last_imu_ts = ts
         msg["timestamp"] = ts
-        return True
+        return True, ""
 
-    def validate_gnss(self, msg: dict) -> bool:
+    def validate_gnss(self, msg: dict) -> tuple[bool, str]:
         if not isinstance(msg, dict):
-            return False
+            return False, "Message is not a JSON object"
+
         raw_ts = msg.get("timestamp")
         if (
             raw_ts is None
@@ -127,54 +134,238 @@ class TelemetryValidator:
             or not math.isfinite(raw_ts)
             or raw_ts <= 0
         ):
-            return False
+            return False, f"Invalid timestamp: {raw_ts}"
 
         lat = msg.get("latitude")
         lon = msg.get("longitude")
         if type(lat) is bool or not isinstance(lat, (int, float)) or not math.isfinite(lat):
-            return False
+            return False, f"Invalid latitude: {lat}"
         if type(lon) is bool or not isinstance(lon, (int, float)) or not math.isfinite(lon):
-            return False
+            return False, f"Invalid longitude: {lon}"
+
+        if not (-90 <= lat <= 90):
+            return False, f"Latitude out of range: {lat}"
+        if not (-180 <= lon <= 180):
+            return False, f"Longitude out of range: {lon}"
 
         for k in ("speed", "heading", "accuracy"):
             v = msg.get(k)
             if v is not None:
                 if type(v) is bool or not isinstance(v, (int, float)) or not math.isfinite(v):
-                    return False
+                    return False, f"Invalid {k}: {v}"
 
         msg["timestamp"] = self.normalize_timestamp(raw_ts)
-        return True
+        return True, ""
 
 
 class TelemetryServer:
 
     def __init__(self, handover_wrapper):
+        self.health = HealthMonitor()
         self.wrapper = handover_wrapper
+        self.wrapper.health = self.health # Inject health monitor into wrapper
         self.validator = TelemetryValidator()
+        self.recorder = SessionRecorder()
+        self.connected_clients = set()
 
     def handle_raw_message(self, raw_data: str):
         try:
             msg = json.loads(raw_data)
-        except Exception:
+        except Exception as e:
+            # We don't log every malformed JSON to avoid flooding, but we record rejection
+            self.health.record_rejection()
             return
+
         self.on_message(msg)
 
     def on_message(self, msg: dict):
         try:
             if not isinstance(msg, dict):
+                self.health.record_rejection()
                 return
+
             msg_type = msg.get("type")
 
             if msg_type == "imu":
-                if self.validator.validate_imu(msg):
+                is_valid, reason = self.validator.validate_imu(msg)
+                # Update finiteness based on validator reason
+                self.health.update_imu_finite(not ("Non-finite" in reason))
+                if is_valid:
+                    self.health.record_imu(msg["timestamp"], msg.get("accelerometer"), msg.get("gyroscope"))
+                    self.recorder.record("imu", msg)
                     self.wrapper.process_imu(msg)
+                else:
+                    print(f"[REJECTED] IMU packet: {reason}")
+                    self.health.record_rejection()
 
             elif msg_type == "gnss":
-                if self.validator.validate_gnss(msg):
+                is_valid, reason = self.validator.validate_gnss(msg)
+                # Update finiteness based on validator reason
+                self.health.update_gnss_finite(not ("finite" in reason.lower()))
+                if is_valid:
+                    self.health.record_gnss(
+                        msg["timestamp"],
+                        accuracy=msg.get("accuracy"),
+                        speed=msg.get("speed"),
+                        heading=msg.get("heading")
+                    )
+                    self.recorder.record("gnss", msg)
                     self.wrapper.handle_gnss(msg)
-        except Exception:
-            return
+                else:
+                    print(f"[REJECTED] GNSS packet: {reason}")
+                    self.health.record_rejection()
 
+            elif msg_type == "config":
+                preset = msg.get("mounting_preset", "UNKNOWN")
+                self.health.update_mounting(preset)
+                print(f"[CONFIG] Mounting preset updated to: {preset}")
+            else:
+                # Unknown type
+                pass
+        except Exception as e:
+            print(f"[SERVER ERROR] Processing message: {e}")
+
+    async def output_loop(self):
+        """Pushes navigation state to clients at 10 Hz."""
+        while True:
+            start_time = time.time()
+
+            # Get latest state from engine without advancing it
+            engine = self.wrapper.engine
+            p = engine.p
+            v = engine.v
+
+            if p is not None:
+                # Convert engine state to Lat/Lon
+                lat, lon = self.wrapper.get_current_latlon()
+
+                # Fallback to 0.0 if not yet aligned
+                lat = lat if lat is not None else 0.0
+                lon = lon if lon is not None else 0.0
+
+                # Construct payload for the mobile app
+                payload = {
+                    "type": "vehicle_position",
+                    "lat": lat,
+                    "lng": lon,
+                    "heading": 0.0, # Simplified for demo
+                    "speed": np.linalg.norm(v) * 3.6, # m/s to km/h
+                    "timestamp": time.time()
+                }
+
+
+
+                # We don't have a LatLon converter in the server, but the mobile app
+                # expects lat/lng. For the demo, we can just send the local X/Y
+                # if we modify the mobile app, or implement a basic converter.
+                # For now, let's just push the state.
+
+                message = json.dumps(payload)
+                for client in list(self.connected_clients):
+                    try:
+                        await client.send(message)
+                    except:
+                        self.connected_clients.discard(client)
+
+                self.recorder.record("nav_state", payload)
+
+            self.health.record_nav()
+
+            # Target 10Hz (100ms)
+            elapsed = time.time() - start_time
+            await asyncio.sleep(max(0, 0.1 - elapsed))
+
+    async def diagnostic_loop(self):
+        """Prints system status to console at 1 Hz."""
+        while True:
+            status = self.health.get_status()
+
+            # Clear terminal
+            print("\033[H\033[J", end="")
+
+            print("========================================================")
+            print(" IDR LIVE STATUS")
+            print("========================================================")
+
+            # Connection
+            conn_status = "CONNECTED" if status.connected else "DISCONNECTED"
+            print(f"Connection : {conn_status}")
+            if status.connected:
+                print(f"Client     : {status.client_id}")
+                print(f"Mounting   : {status.mounting_preset}")
+                print(f"Connected  : {time.strftime('%H:%M:%S', time.localtime(status.connection_time)) if status.connection_time else 'N/A'}")
+            elif status.disconnection_time:
+                print(f"Disconnected at: {time.strftime('%H:%M:%S', time.localtime(status.disconnection_time))}")
+
+            print(f"Session    : {self.recorder.get_session_id()}")
+            print("--------------------------------------------------------")
+
+            # IMU
+            imu_status = "HEALTHY"
+            if status.imu_rate < 20: imu_status = "LOW RATE"
+            if not status.imu_finite: imu_status = "NON-FINITE"
+            if status.sensor_constant: imu_status = "CONSTANT/STUCK"
+
+            print(f"IMU")
+            print(f"Rate       : {status.imu_rate:5.1f} Hz")
+            print(f"Status     : {imu_status}")
+
+            # GNSS
+            gnss_status = "HEALTHY"
+            if status.gnss_rate < 0.5: gnss_status = "LOW RATE"
+            if not status.gnss_finite: gnss_status = "NON-FINITE"
+            if status.gnss_rate == 0: gnss_status = "NO SIGNAL"
+
+            print(f"\nGNSS")
+            print(f"Rate       : {status.gnss_rate:5.1f} Hz")
+            print(f"Accuracy   : {status.gnss_accuracy if status.gnss_accuracy else 'N/A'} m")
+            print(f"Status     : {gnss_status}")
+
+            # Timestamp
+            ts_status = "HEALTHY"
+            if status.timestamp_gaps > 0: ts_status = "GAPS DETECTED"
+            if status.avg_dt > 0.05: ts_status = "HIGH JITTER"
+
+            print(f"\nTIMESTAMP")
+            print(f"dt         : {status.last_dt:5.4f} s")
+            print(f"Status     : {ts_status}")
+
+            # Alignment
+            print(f"\nALIGNMENT")
+            print(f"Status     : {status.alignment_status}")
+            if status.alignment_status == "WAITING":
+                # We'll need a way to get the "Reason" from the wrapper
+                # For now, we just print status
+                pass
+
+            # Navigation
+            print(f"\nNAVIGATION")
+            print(f"Mode       : {status.current_mode}")
+            print(f"Rate       : {status.nav_rate:5.1f} Hz")
+
+            # Position
+            engine = self.wrapper.engine
+            lat, lon = self.wrapper.get_current_latlon()
+            print(f"\nPosition")
+            print(f"Lat        : {lat:.6f}" if lat else "Lat        : N/A")
+            print(f"Lon        : {lon:.6f}" if lon else "Lon        : N/A")
+
+            # Velocity
+            v = engine.v
+            print(f"\nVelocity")
+            print(f"Vx         : {v[0]:5.2f}")
+            print(f"Vy         : {v[1]:5.2f}")
+
+            # ZUPT
+            zupt = "ACTIVE" if getattr(self.wrapper, 'is_zupt_active', False) else "INACTIVE"
+            print(f"\nZUPT       : {zupt}")
+
+            print("\nPackets")
+            print(f"Rejected   : {status.rejected_packets}")
+            print("========================================================")
+            print("Press Ctrl+C to stop server.")
+
+            await asyncio.sleep(1.0)
 
 async def main():
     engine = AIEKFEngine()
@@ -182,16 +373,27 @@ async def main():
     server = TelemetryServer(wrapper)
 
     async def ws_handler(websocket):
+        server.connected_clients.add(websocket)
         try:
             async for message in websocket:
                 server.handle_raw_message(message)
         except Exception:
             pass
+        finally:
+            server.connected_clients.remove(websocket)
 
     print("Starting IDR Telemetry WebSocket Server on ws://0.0.0.0:8765...")
-    async with websockets.serve(ws_handler, "0.0.0.0", 8765):
-        await asyncio.Future()
 
+    # Run server, output loop, and diagnostic loop concurrently
+    async with websockets.serve(ws_handler, "0.0.0.0", 8765):
+        await asyncio.gather(
+            server.output_loop(),
+            server.diagnostic_loop(),
+            asyncio.Future() # Keep main alive
+        )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nServer stopped by user.")

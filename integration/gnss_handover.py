@@ -2,7 +2,7 @@
 
 import math
 import numpy as np
-
+import time
 
 class GNSSHandoverWrapper:
 
@@ -18,6 +18,7 @@ class GNSSHandoverWrapper:
         self.mode = "DR"
         self.last_gnss_timestamp = None
         self.latest_gnss_speed = None
+        self.health = None # Injected by TelemetryServer
 
         # ZUPT configuration and buffer
         self.gnss_speed_threshold = gnss_speed_threshold
@@ -53,12 +54,44 @@ class GNSSHandoverWrapper:
         d_east = d_lon * R_earth * math.cos(math.radians(ref_lat))
         return d_east, d_north
 
+    def _enu_to_latlon(self, east: float, north: float, ref_lat: float, ref_lon: float):
+        # Inverse of _latlon_to_enu
+        R_earth = 6378137.0
+        lat = ref_lat + math.degrees(north / R_earth)
+        lon = ref_lon + math.degrees(east / (R_earth * math.cos(math.radians(ref_lat))))
+        return lat, lon
+
+    def get_current_latlon(self):
+        """Returns the current estimated Lat/Lon based on engine state."""
+        if not self.is_aligned or self.gnss_origin_lat is None:
+            return None, None
+
+        # Engine state (local frame)
+        x_eng = self.engine.p[0]
+        y_eng = self.engine.p[1]
+        psi = self.gnss_yaw_offset
+
+        # Rotate Engine frame back to ENU frame
+        east = x_eng * math.cos(psi) - y_eng * math.sin(psi)
+        north = x_eng * math.sin(psi) + y_eng * math.cos(psi)
+
+        return self._enu_to_latlon(east, north, self.gnss_origin_lat, self.gnss_origin_lon)
+
+
+
     def handle_gnss(self, gnss_data: dict):
         if not self._is_valid_gnss(gnss_data):
             return
 
         self.last_gnss_timestamp = gnss_data["timestamp"]
         self.latest_gnss_speed = gnss_data.get("speed", 0.0)
+
+        # Mode Transition: DR -> GNSS
+        if self.mode == "DR":
+            print(f"\n[MODE CHANGE] DR -> GNSS | Recovery at {self.last_gnss_timestamp:.3f}s")
+            if self.health:
+                self.health.update_mode("GNSS")
+
         self.mode = "GNSS"
 
         lat = gnss_data["latitude"]
@@ -68,6 +101,7 @@ class GNSSHandoverWrapper:
         if self.gnss_origin_lat is None:
             self.gnss_origin_lat = lat
             self.gnss_origin_lon = lon
+            print(f"[GNSS] Origin established: {lat:.6f}, {lon:.6f}")
             return
 
         # 2. Convert to local ENU relative to origin
@@ -76,9 +110,15 @@ class GNSSHandoverWrapper:
         # 3. Dynamic Alignment via Course Over Ground (COG)
         if not self.is_aligned:
             dist = math.hypot(d_east, d_north)
-            if dist >= 5.0 and self.latest_gnss_speed >= 3.0:
+            speed = self.latest_gnss_speed
+            print(f"[ALIGNMENT] Waiting... Dist: {dist:.2f}m (req >= 5m), Speed: {speed:.2f}m/s (req >= 3m/s)")
+
+            if dist >= 5.0 and speed >= 3.0:
                 self.gnss_yaw_offset = math.atan2(d_north, d_east)
                 self.is_aligned = True
+                print(f"[ALIGNMENT] SUCCESS! Yaw Offset: {math.degrees(self.gnss_yaw_offset):.2f}°")
+                if self.health:
+                    self.health.update_alignment("ALIGNED")
             else:
                 return  # Do not inject position before alignment is complete
 
@@ -87,15 +127,20 @@ class GNSSHandoverWrapper:
             psi = self.gnss_yaw_offset
             cos_psi = math.cos(psi)
             sin_psi = math.sin(psi)
-            
+
             # Rotate ENU displacement into engine X/Y frame
             x_eng = d_east * cos_psi + d_north * sin_psi
             y_eng = -d_east * sin_psi + d_north * cos_psi
-            
+
             self.engine.p[0] = x_eng
             self.engine.p[1] = y_eng
 
     def mark_gnss_lost(self):
+        if self.mode == "GNSS":
+            print(f"\n[MODE CHANGE] GNSS -> DR | Timeout at {time.time():.3f}s")
+            if self.health:
+                self.health.update_mode("DR")
+
         self.mode = "DR"
         self.latest_gnss_speed = None
 
@@ -134,5 +179,7 @@ class GNSSHandoverWrapper:
                     self.is_zupt_active = True
                     y_zero = np.zeros(3)
                     self.engine.update(y_zero, self.zupt_R)
+                    # We don't print every ZUPT to avoid flooding, but we could
+                    # print(f"[ZUPT] Active | Speed: {self.latest_gnss_speed:.2f}")
 
         self.engine.predict(imu_sample)

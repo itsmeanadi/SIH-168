@@ -100,23 +100,23 @@ def test_existing_timestamp_validation_works():
 
     # 2. Invalid timestamps (<= 0, NaN, Inf, non-numeric)
     bad_ts_msg = {"type": "imu", "timestamp": -1.0, "accelerometer": [0, 0, 9.81], "gyroscope": [0, 0, 0]}
-    assert validator.validate_imu(bad_ts_msg) is False
+    assert validator.validate_imu(bad_ts_msg)[0] is False
 
     zero_ts_msg = {"type": "imu", "timestamp": 0.0, "accelerometer": [0, 0, 9.81], "gyroscope": [0, 0, 0]}
-    assert validator.validate_imu(zero_ts_msg) is False
+    assert validator.validate_imu(zero_ts_msg)[0] is False
 
     # 3. Valid initial sample
     s1 = {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0, 0, 9.81], "gyroscope": [0, 0, 0]}
-    assert validator.validate_imu(s1) is True
+    assert validator.validate_imu(s1)[0] is True
 
     # 4. Non-monotonic timestamp (dt <= 0) rejected
     s_backwards = {"type": "imu", "timestamp": 1700000000.0, "accelerometer": [0, 0, 9.81], "gyroscope": [0, 0, 0]}
-    assert validator.validate_imu(s_backwards) is False
+    assert validator.validate_imu(s_backwards)[0] is False
 
     # 5. Timestamp gap exceeding max_imu_dt (dt > 0.2) rejected
     s_too_late = {"type": "imu", "timestamp": 1700000000.5, "accelerometer": [0, 0, 9.81], "gyroscope": [0, 0, 0]}
-    assert validator.validate_imu(s_too_late) is False
+    assert validator.validate_imu(s_too_late)[0] is False
 
     # 6. Valid subsequent sample (dt = 0.02, 50 Hz)
     s_valid = {"type": "imu", "timestamp": 1700000000.02, "accelerometer": [0, 0, 9.81], "gyroscope": [0, 0, 0]}
-    assert validator.validate_imu(s_valid) is True
+    assert validator.validate_imu(s_valid)[0] is True
