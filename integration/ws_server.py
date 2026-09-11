@@ -164,11 +164,11 @@ class TelemetryServer:
         self.health = HealthMonitor()
         self.wrapper = handover_wrapper
         self.wrapper.health = self.health # Inject health monitor into wrapper
-        self.validator = TelemetryValidator()
+        self.validators = {} # Map: websocket -> TelemetryValidator
         self.recorder = SessionRecorder()
         self.connected_clients = set()
 
-    def handle_raw_message(self, raw_data: str):
+    def handle_raw_message(self, raw_data: str, client):
         try:
             msg = json.loads(raw_data)
         except Exception as e:
@@ -176,9 +176,9 @@ class TelemetryServer:
             self.health.record_rejection()
             return
 
-        self.on_message(msg)
+        self.on_message(msg, client)
 
-    def on_message(self, msg: dict):
+    def on_message(self, msg: dict, client):
         try:
             if not isinstance(msg, dict):
                 self.health.record_rejection()
@@ -186,8 +186,11 @@ class TelemetryServer:
 
             msg_type = msg.get("type")
 
+            # Get or create validator for this specific client session
+            validator = self.validators.setdefault(client, TelemetryValidator())
+
             if msg_type == "imu":
-                is_valid, reason = self.validator.validate_imu(msg)
+                is_valid, reason = validator.validate_imu(msg)
                 # Update finiteness based on validator reason
                 self.health.update_imu_finite(not ("Non-finite" in reason))
                 if is_valid:
@@ -199,7 +202,7 @@ class TelemetryServer:
                     self.health.record_rejection()
 
             elif msg_type == "gnss":
-                is_valid, reason = self.validator.validate_gnss(msg)
+                is_valid, reason = validator.validate_gnss(msg)
                 # Update finiteness based on validator reason
                 self.health.update_gnss_finite(not ("finite" in reason.lower()))
                 if is_valid:
@@ -376,11 +379,14 @@ async def main():
         server.connected_clients.add(websocket)
         try:
             async for message in websocket:
-                server.handle_raw_message(message)
+                server.handle_raw_message(message, websocket)
         except Exception:
             pass
         finally:
             server.connected_clients.remove(websocket)
+            # Cleanup validator state for this session
+            if websocket in server.validators:
+                del server.validators[websocket]
 
     print("Starting IDR Telemetry WebSocket Server on ws://0.0.0.0:8765...")
 

@@ -105,6 +105,12 @@ class AIDREngine:
         self.step_count = 0
         self.latest_measurement_cov = np.array([self.params.cov_lat, self.params.cov_up], dtype=np.float64)
 
+        # Static tilt flag: Rot is initialized to identity; on the very first IMU
+        # sample we compute roll/pitch from the measured gravity vector so that
+        # acc_world = Rot * f_b + g_world ≈ 0 while the vehicle is stationary.
+        # Yaw is left at zero and is NOT estimated from gravity.
+        self._static_tilt_initialized: bool = False
+
     def _init_covariance(self):
         """Initialize covariance matrix P."""
         self.P[:2, :2] = self.params.cov_Rot0 * np.eye(2)
@@ -150,6 +156,28 @@ class AIDREngine:
 
         # First sample initialization
         if self.last_timestamp is None:
+            # Static gravity alignment: estimate roll & pitch from the first
+            # accelerometer reading so that gravity cancels in _propagate.
+            # Convention (ZYX, body-to-world, Rot = Rz(yaw)*Ry(pitch)*Rx(roll)):
+            #   At rest:  Rot * f_b + g_world = 0
+            #             => Rot * f_b = [0, 0, +9.80655]   (world-up)
+            #             => f_b / |f_b| = Rot^T * [0,0,1]
+            # Extracting roll/pitch with yaw fixed at current yaw (0 at init):
+            #   pitch = atan2( fx,  sqrt(fy^2 + fz^2) )
+            #   roll  = atan2(-fy,  fz )
+            # where [fx, fy, fz] = f_b normalised.
+            # Yaw is NOT touched; it is determined solely by GNSS frame alignment.
+            if not self._static_tilt_initialized:
+                norm_a = float(np.linalg.norm(acc))
+                if norm_a > 1.0:  # Guard: skip if adapter returned near-zero vector
+                    f_hat = acc / norm_a          # unit vector (body frame)
+                    fx, fy, fz = f_hat[0], f_hat[1], f_hat[2]
+                    roll_est  = float(np.arctan2(-fy, fz))
+                    pitch_est = float(np.arctan2(fx, np.sqrt(fy * fy + fz * fz)))
+                    # Preserve existing yaw (0 at cold start, or whatever set_initial_state set)
+                    _, _, current_yaw = to_rpy(self.Rot)
+                    self.Rot = from_rpy(roll_est, pitch_est, current_yaw)
+                self._static_tilt_initialized = True
             self.last_timestamp = t
             return self._build_nav_state(t)
 
