@@ -175,9 +175,11 @@ class AIDREngine:
     def _evaluate_motion_integrity(self):
         """
         Fix 7: Motion and Sensor Integrity Evaluation.
-        Detects abnormal handheld isotropic vibration vs legitimate vehicle dynamics.
-        - Handheld shake -> SHAKE_PROTECTED, ai_trust = 0.0
-        - Normal vehicle motion / legitimate acceleration / turns -> NORMAL / HIGH_DYNAMICS, ai_trust = 1.0
+        Continuously regulates dynamic AI trust [0.0, 1.0] based on:
+        - Handheld isotropic shake / vibration energy
+        - Transverse rotational noise vs legitimate yaw
+        - Kinematic dynamics and signal consistency
+        - Smooth exponential moving average (EMA) temporal filter
         """
         if len(self._acc_buffer) < self._stationary_buffer_size:
             self.motion_state = "NORMAL"
@@ -204,7 +206,16 @@ class AIDREngine:
 
         if is_shake:
             self.motion_state = "SHAKE_PROTECTED"
-            self.ai_trust = 0.0
+            # Scale target trust down smoothly towards 0.0 under sustained shake
+            shake_intensity = max(
+                (acc_std_mag - self.params.shake_acc_mag_thresh) / max(self.params.shake_acc_mag_thresh, 0.1),
+                (transverse_gyro_std - 0.18) / 0.15
+            )
+            if shake_intensity > 0.8:
+                target_trust = 0.0
+            else:
+                target_trust = float(np.clip(0.35 * (1.0 - shake_intensity), 0.0, 0.35))
+            alpha = 0.40  # Rapid protective drop
         else:
             acc_mean = np.mean(acc_arr, axis=0)
             acc_world_mean = self.Rot.dot(acc_mean - self.b_acc) + self.params.g
@@ -215,6 +226,22 @@ class AIDREngine:
                 self.motion_state = "HIGH_DYNAMICS"
             else:
                 self.motion_state = "NORMAL"
+
+            # Modulate target trust based on transverse gyro disturbance and multi-axis acceleration jitter
+            noise_penalty = 0.0
+            if transverse_gyro_std > 0.08:
+                noise_penalty += (transverse_gyro_std - 0.08) * 1.5
+            if acc_axes_high >= 2 and acc_std_mag > 1.2:
+                noise_penalty += (acc_std_mag - 1.2) * 0.15
+
+            target_trust = float(np.clip(1.0 - min(0.5, noise_penalty), 0.5, 1.0))
+            alpha = 0.12  # Smooth recovery
+
+        # Apply smooth EMA filter
+        self.ai_trust = float(np.clip((1.0 - alpha) * self.ai_trust + alpha * target_trust, 0.0, 1.0))
+        if target_trust == 0.0 and self.ai_trust < 0.03:
+            self.ai_trust = 0.0
+        elif target_trust == 1.0 and self.ai_trust > 0.985:
             self.ai_trust = 1.0
 
     def update(self,
