@@ -1,0 +1,19 @@
+{
+    "expo": {
+        "name": "Vehicle Navigation",
+        "slug": "vehicle-navigation",
+        "version": "1.0.0",
+        "orientation": "portrait",
+        "userInterfaceStyle": "light",
+        "assetBundlePatterns": [
+            "**/*"
+        ],
+        "android": {
+            "package": "com.vehicle.navigation",
+            "permissions": [
+                "ACCESS_COARSE_LOCATION",
+                "ACCESS_FINE_LOCATION"
+            ]
+        }
+    }
+}
