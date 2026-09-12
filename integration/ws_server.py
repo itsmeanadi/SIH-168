@@ -548,7 +548,7 @@ async def main():
 
     print("Starting IDR Telemetry WebSocket Server on ws://0.0.0.0:8765...")
 
-import os
+    import os
     port = int(os.environ.get("PORT", 8765))
 
     # Run server, output loop, and diagnostic loop concurrently
