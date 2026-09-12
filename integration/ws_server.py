@@ -495,7 +495,7 @@ class TelemetryServer:
             print(f"Mode       : {status.current_mode}")
             print(f"Rate       : {status.nav_rate:5.1f} Hz")
             print(f"State      : {getattr(engine, 'motion_state', 'NORMAL')}")
-            print(f"AI Trust   : {getattr(engine, 'ai_trust', 1.0):5.2f}")
+            print(f"AI Confidence   : {getattr(engine, 'ai_trust', 1.0):5.2f}")
 
             # Position
             lat, lon = self.wrapper.get_current_latlon()
