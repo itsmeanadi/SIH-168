@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "Vehicle Navigation",
+    "slug": "drive",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "android": {
+      "package": "com.vehicle.navigation",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE",
+        "HIGH_SAMPLING_RATE_SENSORS"
+      ]
+    },
+    "plugins": [
+      "expo-asset",
+      "expo-status-bar"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "80bdbba8-7aad-4056-8b0e-03fcef3c4545"
+      }
+    },
+    "owner": "anadiiiiis-team"
+  }
+}
