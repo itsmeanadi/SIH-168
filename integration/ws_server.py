@@ -255,6 +255,28 @@ class TelemetryServer:
 
             msg_type = msg.get("type")
 
+            if msg_type == "v2v_broadcast":
+                # Create the correction packet
+                correction_msg = {
+                    "type": "v2v_correction",
+                    "lat": msg.get("lat"),
+                    "lng": msg.get("lng"),
+                    "heading": msg.get("heading"),
+                    "sender": msg.get("sender", "unknown"),
+                    "is_sos": msg.get("is_sos", False)
+                }
+                correction_json = json.dumps(correction_msg)
+                
+                # Relay to all OTHER clients
+                for c in list(self.connected_clients):
+                    if c != client:
+                        try:
+                            # Use asyncio.create_task to avoid blocking
+                            asyncio.create_task(c.send(correction_json))
+                        except Exception:
+                            pass
+                return
+
             # Handle composite sensor frame (e.g. from Android Web Bridge / PWA / mobile clients)
             if msg_type == "sensor_frame" or ("imu" in msg and isinstance(msg.get("imu"), dict)):
                 imu_data = msg.get("imu")
@@ -526,8 +548,11 @@ async def main():
 
     print("Starting IDR Telemetry WebSocket Server on ws://0.0.0.0:8765...")
 
+import os
+    port = int(os.environ.get("PORT", 8765))
+
     # Run server, output loop, and diagnostic loop concurrently
-    async with websockets.serve(ws_handler, "0.0.0.0", 8765, process_request=process_request):
+    async with websockets.serve(ws_handler, "0.0.0.0", port, process_request=process_request):
         await asyncio.gather(
             server.output_loop(),
             server.diagnostic_loop(),
