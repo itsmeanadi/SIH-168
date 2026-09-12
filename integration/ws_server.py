@@ -363,7 +363,7 @@ class TelemetryServer:
 
                 # Clamped speed to prevent drift when stationary
                 raw_speed = float(np.linalg.norm(v) * 3.6) if v is not None else 0.0
-                if not is_aligned or is_zupt or raw_speed < 0.6:
+                if not is_aligned or is_zupt or raw_speed < 3.0:
                     reported_speed = 0.0
                 else:
                     reported_speed = raw_speed
